@@ -1,5 +1,6 @@
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
+const { getJwtSecret } = require('../config/secrets');
 
 const protect = async (req, res, next) => {
   let token;
@@ -18,10 +19,14 @@ const protect = async (req, res, next) => {
   }
 
   try {
-    const decoded = jwt.verify(
-      token,
-      process.env.JWT_SECRET || 'super_secret_cryptographic_jwt_key_2026'
-    );
+    const jwtSecret = getJwtSecret();
+    if (!jwtSecret) {
+      return res.status(503).json({
+        success: false,
+        message: 'JWT_SECRET is not configured on the server. Authentication is unavailable.',
+      });
+    }
+    const decoded = jwt.verify(token, jwtSecret);
     
     // In fallback mode if DB is disconnected, supply decoded payload
     try {

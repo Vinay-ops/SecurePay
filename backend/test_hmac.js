@@ -13,7 +13,8 @@ console.log('====================================================');
 console.log('🧪 RUNNING CRYPTOGRAPHIC HMAC & SHA-256 TEST SUITE');
 console.log('====================================================\n');
 
-const secretKey = 'gateway_shared_hmac_master_secret_key_8849';
+// Random per-run test key: no hardcoded secrets anywhere in the codebase.
+const secretKey = crypto.randomBytes(32).toString('hex');
 
 // Test Case 1: Create normal transaction -> SHA-256 valid -> HMAC valid
 console.log('--- TEST 1: Normal Transaction Creation & Validation ---');

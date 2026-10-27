@@ -4,6 +4,7 @@ const {
   simulateTamperingAttack,
   simulateReplayAttack,
   simulateForgeryAttack,
+  simulateFakeConfirmation,
   simulateAttack,
 } = require('../controllers/simulationController');
 
@@ -11,6 +12,7 @@ const {
 router.post('/tamper', simulateTamperingAttack);
 router.post('/replay', simulateReplayAttack);
 router.post('/forge', simulateForgeryAttack);
+router.post('/fake-confirmation', simulateFakeConfirmation);
 
 // Legacy unified endpoint
 router.post('/attack', simulateAttack);

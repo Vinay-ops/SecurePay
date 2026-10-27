@@ -37,6 +37,8 @@ const securityLogSchema = new mongoose.Schema(
         'COMBINED_SECURITY_VERIFIED',
         'COMBINED_SECURITY_FAILED',
         'SIMULATION_ATTACK_LAUNCHED',
+        'FAKE_CONFIRMATION_DETECTED',
+        'FAKE_CONFIRMATION_VERIFIED',
         'AUTH_SUCCESS',
         'AUTH_FAILURE',
         'KEY_GENERATED',

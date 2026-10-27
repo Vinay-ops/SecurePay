@@ -9,12 +9,19 @@ const {
   verifyHMAC,
   verifyRSA,
 } = require('../crypto');
+const { requireHmacSecret } = require('../config/secrets');
 
 /**
  * Interactive validator for inspecting transaction integrity, HMAC, and RSA signatures
  */
 const inspectTransaction = async (req, res, next) => {
   try {
+    // SECURITY: the HMAC secret is resolved SERVER-SIDE only. A client-supplied
+    // secret is ignored so an attacker can never make verification pass by
+    // submitting a secret of their own choosing.
+    const hmacSecret = requireHmacSecret(res);
+    if (!hmacSecret) return;
+
     const {
       transactionId,
       senderName,
@@ -27,7 +34,6 @@ const inspectTransaction = async (req, res, next) => {
       hmacSignature,
       rsaSignature,
       senderPublicKey,
-      hmacSecret = process.env.HMAC_SECRET || 'gateway_shared_hmac_master_secret_key_8849',
     } = req.body;
 
     const rawPayload = {

@@ -22,78 +22,28 @@ const {
   generateRSAKeyPair,
 } = require('../crypto');
 const { recordSecurityEvent } = require('./securityController');
-const { inMemoryTransactions } = require('../store/inMemoryStore');
-const { inMemoryUsers } = require('./authController');
+const { inMemoryTransactions, saveStore } = require('../store/inMemoryStore');
+const {
+  resolveAccount,
+  getBalance,
+  debit,
+  credit,
+} = require('../store/demoAccounts');
+const { requireHmacSecret, getStorageMode } = require('../config/secrets');
 
 /**
- * Adjust sender and receiver balances in both MongoDB (if online) and in-memory store
+ * Read current demo account balances without mutating anything.
+ * Balances are transferred only when the server processes (accepts) a transaction.
  */
-async function adjustBalances(senderIdentifier, receiverIdentifier, amount, userId) {
+async function getCurrentBalances(senderIdentifier, receiverIdentifier) {
   let senderBalance = null;
   let receiverBalance = null;
-  const numAmount = Number(amount);
-  const isDbReady = mongoose.connection && mongoose.connection.readyState === 1;
-
-  // 1. Database adjustment
-  if (isDbReady) {
-    try {
-      if (userId) {
-        const u = await User.findByIdAndUpdate(
-          userId,
-          { $inc: { balance: -numAmount } },
-          { new: true }
-        );
-        if (u) senderBalance = u.balance;
-      } else if (senderIdentifier) {
-        const u = await User.findOneAndUpdate(
-          { $or: [{ email: String(senderIdentifier).toLowerCase().trim() }, { name: String(senderIdentifier).trim() }] },
-          { $inc: { balance: -numAmount } },
-          { new: true }
-        );
-        if (u) senderBalance = u.balance;
-      }
-
-      if (receiverIdentifier) {
-        const r = await User.findOneAndUpdate(
-          { $or: [{ email: String(receiverIdentifier).toLowerCase().trim() }, { name: String(receiverIdentifier).trim() }] },
-          { $inc: { balance: numAmount } },
-          { new: true }
-        );
-        if (r) receiverBalance = r.balance;
-      }
-    } catch (e) {
-      console.warn('DB balance update warning:', e.message);
-    }
+  try {
+    if (senderIdentifier) senderBalance = await getBalance(senderIdentifier);
+    if (receiverIdentifier) receiverBalance = await getBalance(receiverIdentifier);
+  } catch (e) {
+    console.warn('Balance lookup warning:', e.message);
   }
-
-  // 2. In-memory fallback adjustment
-  if (inMemoryUsers && inMemoryUsers.size > 0) {
-    for (const [email, u] of inMemoryUsers.entries()) {
-      const isSenderMatch =
-        (userId && String(u._id || u.id) === String(userId)) ||
-        (senderIdentifier && (
-          email === String(senderIdentifier).toLowerCase().trim() ||
-          u.name?.toLowerCase().trim() === String(senderIdentifier).toLowerCase().trim()
-        ));
-
-      if (isSenderMatch) {
-        u.balance = Math.max(0, (u.balance !== undefined ? u.balance : 50000) - numAmount);
-        if (senderBalance === null) senderBalance = u.balance;
-      }
-
-      const isReceiverMatch =
-        receiverIdentifier && (
-          email === String(receiverIdentifier).toLowerCase().trim() ||
-          u.name?.toLowerCase().trim() === String(receiverIdentifier).toLowerCase().trim()
-        );
-
-      if (isReceiverMatch) {
-        u.balance = (u.balance !== undefined ? u.balance : 50000) + numAmount;
-        if (receiverBalance === null) receiverBalance = u.balance;
-      }
-    }
-  }
-
   return { senderBalance, receiverBalance };
 }
 
@@ -135,7 +85,40 @@ const createTransaction = async (req, res, next) => {
     if (isNaN(numAmount) || numAmount <= 0) {
       return res.status(400).json({
         success: false,
+        reason: 'INVALID_AMOUNT',
         message: 'Validation Error: Amount must be a positive number greater than 0.',
+      });
+    }
+
+    if (!Number.isFinite(numAmount) || numAmount > 1_000_000_000) {
+      return res.status(400).json({
+        success: false,
+        reason: 'INVALID_AMOUNT',
+        message: 'Validation Error: Amount is outside the acceptable range.',
+      });
+    }
+
+    // Balance validation (demo accounts). Balances are only MOVED when the
+    // server processes the transaction; here we reject obviously unfundable
+    // transfers early so the demo shows a real server-side rejection.
+    const { senderBalance, receiverBalance } = await getCurrentBalances(sender, receiver);
+    if (typeof senderBalance === 'number' && senderBalance < numAmount) {
+      try {
+        await recordSecurityEvent({
+          eventType: 'TRANSACTION_REJECTED',
+          result: 'BLOCKED',
+          severity: 'MEDIUM',
+          details: `Transfer rejected before signing: ${sender} has demo balance ${senderBalance} which is less than requested ${numAmount}.`,
+          metadata: { amount: numAmount, senderBalance, sender, receiver },
+        });
+      } catch (e) {}
+
+      return res.status(400).json({
+        success: false,
+        reason: 'INSUFFICIENT_BALANCE',
+        message: `Insufficient demo balance: ${sender} holds ${Number(senderBalance).toFixed(2)} but the transfer requires ${numAmount.toFixed(2)}.`,
+        senderBalance,
+        requestedAmount: numAmount,
       });
     }
 
@@ -166,7 +149,8 @@ const createTransaction = async (req, res, next) => {
     const transactionHash = hashSHA256(canonicalString);
 
     // 7. Generate HMAC-SHA-256 using server-side secret (Never sent to client)
-    const hmacSecret = process.env.HMAC_SECRET || 'gateway_shared_hmac_master_secret_key_8849';
+    const hmacSecret = requireHmacSecret(res);
+    if (!hmacSecret) return;
     const hmacSignature = generateHMAC(canonicalString, hmacSecret);
 
     // 8. Generate RSA-2048 Digital Signature using sender's private key
@@ -234,6 +218,7 @@ const createTransaction = async (req, res, next) => {
 
     let savedTx = txRecord;
     const isDbReady = mongoose.connection && mongoose.connection.readyState === 1;
+    let usingLocalStore = !isDbReady;
     if (isDbReady) {
       try {
         savedTx = await Transaction.create(txRecord);
@@ -246,18 +231,16 @@ const createTransaction = async (req, res, next) => {
           });
         }
         inMemoryTransactions.unshift(txRecord);
+        usingLocalStore = true;
       }
     } else {
       inMemoryTransactions.unshift(txRecord);
     }
+    if (usingLocalStore) saveStore();
 
-    // Adjust balances for sender and receiver (MongoDB + In-Memory)
-    const { senderBalance, receiverBalance } = await adjustBalances(
-      sender,
-      receiver,
-      numAmount,
-      req.user?._id || req.user?.id
-    );
+    // Balances are NOT moved at creation time. The server transfers funds
+    // atomically only when the transaction passes every verification and is
+    // processed (see processTransaction below).
 
     // Security Log Event
     try {
@@ -285,6 +268,9 @@ const createTransaction = async (req, res, next) => {
       senderPublicKeyFingerprint: senderKeyFingerprint,
       senderBalance,
       receiverBalance,
+      amountReserved: numAmount,
+      balancesTransferredOnProcess: true,
+      storageMode: getStorageMode(mongoose.connection && mongoose.connection.readyState === 1),
       status: 'PENDING',
       integrityStatus: '✓ INTEGRITY VERIFIED',
       authenticationStatus: '✓ AUTHENTICATED & NON-REPUDIATED',
@@ -418,7 +404,8 @@ const processTransaction = async (req, res, next) => {
     const canonicalString = canonicalize(reconstructedPayloadObject);
     const isShaValid = verifySHA256(canonicalString, storedHash);
 
-    const hmacSecret = process.env.HMAC_SECRET || 'gateway_shared_hmac_master_secret_key_8849';
+    const hmacSecret = requireHmacSecret(res);
+    if (!hmacSecret) return;
     const isHmacValid = storedHmac ? verifyHMAC(canonicalString, hmacSecret, storedHmac) : true;
     const isRsaValid = (storedSignature && senderPublicKey)
       ? verifyRSA(canonicalString, storedSignature, senderPublicKey)
@@ -437,7 +424,40 @@ const processTransaction = async (req, res, next) => {
       });
     }
 
-    // Step 5: Atomic Double-Processing Prevention Update (PENDING -> COMPLETED)
+    // Step 5: Atomic funds transfer (debit sender, then CAS PENDING -> COMPLETED,
+    // then credit receiver). A duplicate submission never reaches the debit step,
+    // and a failed CAS refunds the debit, so money and status stay consistent.
+    const transferAmount = parseFloat(Number(transaction.amount).toFixed(2));
+    const senderIdentifier = transaction.sender || transaction.senderName;
+    const receiverIdentifier = transaction.receiver || transaction.receiverName;
+
+    const debitResult = await debit(senderIdentifier, transferAmount);
+    if (!debitResult.ok) {
+      try {
+        await recordSecurityEvent({
+          eventType: 'TRANSACTION_REJECTED',
+          result: 'BLOCKED',
+          severity: 'MEDIUM',
+          details: `Server rejected TX ${transaction.transactionId}: balance transfer refused (${debitResult.reason}).`,
+          transactionId: transaction.transactionId,
+          metadata: { reason: debitResult.reason, transferAmount },
+        });
+      } catch (e) {}
+
+      return res.status(400).json({
+        success: false,
+        reason: debitResult.reason || 'INSUFFICIENT_BALANCE',
+        message:
+          debitResult.reason === 'INSUFFICIENT_BALANCE'
+            ? `Insufficient demo balance for ${senderIdentifier}: available ${debitResult.balance}, required ${transferAmount}.`
+            : 'Balance transfer could not be completed. Transaction rejected.',
+        transactionId: transaction.transactionId,
+        senderBalance: debitResult.balance,
+        requestedAmount: transferAmount,
+      });
+    }
+
+    // Step 6: Atomic Double-Processing Prevention Update (PENDING -> COMPLETED)
     const processedTimestamp = new Date();
     let finalTx = null;
 
@@ -463,7 +483,8 @@ const processTransaction = async (req, res, next) => {
       );
 
       if (!finalTx) {
-        // Double-processing race condition prevented
+        // Double-processing race condition prevented -> refund the debit
+        await credit(senderIdentifier, transferAmount);
         return res.status(409).json({
           success: false,
           reason: 'REPLAY_ATTACK_DETECTED',
@@ -479,6 +500,7 @@ const processTransaction = async (req, res, next) => {
       );
       if (memIdx !== -1) {
         if (inMemoryTransactions[memIdx].status === 'COMPLETED' || inMemoryTransactions[memIdx].processedAt) {
+          await credit(senderIdentifier, transferAmount);
           return res.status(409).json({
             success: false,
             reason: 'REPLAY_ATTACK_DETECTED',
@@ -499,10 +521,24 @@ const processTransaction = async (req, res, next) => {
       }
     }
 
+    // Step 7: Credit the receiver now that the transaction is committed.
+    const creditResult = await credit(receiverIdentifier, transferAmount);
+    if (!creditResult.ok) {
+      await credit(senderIdentifier, transferAmount); // undo the debit
+      return res.status(500).json({
+        success: false,
+        reason: 'BALANCE_UPDATE_FAILED',
+        message: 'Transaction was verified but the receiver balance update failed. The sender debit was refunded.',
+        transactionId: transaction.transactionId,
+      });
+    }
+    if (!isDbReady) saveStore();
     // Register nonce as consumed in memory store
     consumeNonce(transaction.nonce, transaction.timestamp);
 
-    // Step 6: Log Successful Execution
+    const { senderBalance, receiverBalance } = await getCurrentBalances(senderIdentifier, receiverIdentifier);
+
+    // Step 8: Log Successful Execution
     try {
       await recordSecurityEvent({
         eventType: 'TRANSACTION_PROCESSED',
@@ -523,6 +559,16 @@ const processTransaction = async (req, res, next) => {
       consumedAt: processedTimestamp,
       nonce: transaction.nonce,
       timestamp: transaction.timestamp,
+      amount: transferAmount,
+      sender: senderIdentifier,
+      receiver: receiverIdentifier,
+      senderBalance,
+      receiverBalance,
+      transfer: {
+        applied: true,
+        debitedSender: transferAmount,
+        creditedReceiver: transferAmount,
+      },
       freshnessWindowSeconds: maxAgeSeconds,
       ageSeconds: parseFloat(ageSeconds.toFixed(2)),
       replayProtection: {
@@ -716,7 +762,8 @@ const verifyTransactionHMAC = async (req, res, next) => {
     });
 
     const reconstructedCanonical = canonicalize(reconstructedPayloadObject);
-    const secretKey = process.env.HMAC_SECRET || 'gateway_shared_hmac_master_secret_key_8849';
+    const secretKey = requireHmacSecret(res);
+    if (!secretKey) return;
     const calculatedHmac = generateHMAC(reconstructedCanonical, secretKey);
     const isMatch = verifyHMAC(reconstructedCanonical, secretKey, storedHmac);
 
@@ -984,7 +1031,8 @@ const verifyTransactionCombinedSecurity = async (req, res, next) => {
 
     // 2. HMAC-SHA-256 Authentication Verification
     const storedHmac = transaction.hmac || transaction.hmacSignature || '';
-    const hmacSecret = process.env.HMAC_SECRET || 'gateway_shared_hmac_master_secret_key_8849';
+    const hmacSecret = requireHmacSecret(res);
+    if (!hmacSecret) return;
     const calculatedHmac = generateHMAC(canonicalString, hmacSecret);
     const hmacVerified = storedHmac ? verifyHMAC(canonicalString, hmacSecret, storedHmac) : true;
 
@@ -1223,6 +1271,72 @@ const getTransactionById = async (req, res, next) => {
   }
 };
 
+/**
+ * Authoritative server-side transaction status.
+ * GET /api/transactions/:transactionId/status
+ *
+ * The server - not the client - is the source of truth for whether a payment
+ * exists and whether it was actually processed. Used to expose the difference
+ * between a fake client-side confirmation and a server-confirmed payment.
+ */
+const getTransactionStatus = async (req, res, next) => {
+  try {
+    // Route is mounted as '/:id/status' (and '/:transactionId/status')
+    const transactionId = req.params.transactionId || req.params.id;
+    let transaction = null;
+    const isDbReady = mongoose.connection && mongoose.connection.readyState === 1;
+
+    if (isDbReady) {
+      try {
+        const isObjectId = mongoose.Types.ObjectId.isValid(transactionId);
+        transaction = await Transaction.findOne(
+          isObjectId ? { $or: [{ transactionId }, { _id: transactionId }] } : { transactionId }
+        );
+      } catch (e) {}
+    }
+
+    if (!transaction) {
+      transaction = inMemoryTransactions.find(
+        (t) => t.transactionId === transactionId || String(t._id) === String(transactionId)
+      );
+    }
+
+    if (!transaction) {
+      return res.status(200).json({
+        success: true,
+        exists: false,
+        transactionId,
+        serverStatus: 'NOT_FOUND',
+        approved: false,
+        message:
+          'The server has no record of this transaction. A payment confirmation referencing this ID is unverified.',
+      });
+    }
+
+    const serverStatus = transaction.status || 'PENDING';
+    const approved = serverStatus === 'COMPLETED' || serverStatus === 'SUCCESS';
+
+    res.status(200).json({
+      success: true,
+      exists: true,
+      transactionId: transaction.transactionId,
+      serverStatus,
+      approved,
+      amount: transaction.amount,
+      currency: transaction.currency || 'INR',
+      sender: transaction.sender || transaction.senderName,
+      receiver: transaction.receiver || transaction.receiverName,
+      timestamp: transaction.timestamp,
+      processedAt: transaction.processedAt || null,
+      message: approved
+        ? 'Server confirmed: this transaction was processed and funds were transferred.'
+        : `Server status is ${serverStatus}: funds have NOT been transferred for this transaction.`,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 module.exports = {
   createTransaction,
   processTransaction,
@@ -1232,5 +1346,6 @@ module.exports = {
   verifyTransactionCombinedSecurity,
   getTransactions,
   getTransactionById,
+  getTransactionStatus,
   inMemoryTransactions,
 };

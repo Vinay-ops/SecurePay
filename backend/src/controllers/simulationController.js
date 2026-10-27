@@ -19,6 +19,7 @@ const {
   consumeNonce,
 } = require('../crypto');
 const { inMemoryTransactions } = require('../store/inMemoryStore');
+const { requireHmacSecret } = require('../config/secrets');
 
 /**
  * Helper to retrieve a transaction by ID from MongoDB or in-memory fallback
@@ -109,7 +110,8 @@ const simulateTamperingAttack = async (req, res, next) => {
     const sha256Valid = verifySHA256(tamperedCanonical, storedHash);
 
     // 2. Recalculate HMAC on tampered payload and compare to original stored HMAC
-    const hmacSecret = process.env.HMAC_SECRET || 'gateway_shared_hmac_master_secret_key_8849';
+    const hmacSecret = requireHmacSecret(res);
+    if (!hmacSecret) return;
     const tamperedCalculatedHmac = generateHMAC(tamperedCanonical, hmacSecret);
     const hmacValid = verifyHMAC(tamperedCanonical, hmacSecret, storedHmac);
 
@@ -138,6 +140,28 @@ const simulateTamperingAttack = async (req, res, next) => {
       success: true,
       attack: 'tampering',
       attackDetected,
+      // Legacy summary shape kept for older academic demo scripts/tests.
+      simulation: {
+        attackType: 'TRANSACTION_TAMPERING',
+        attackDetected,
+        verdict: attackDetected
+          ? 'ATTACK DETECTED & BLOCKED by cryptographic integrity guards'
+          : 'ATTACK SUCCEEDED - SECURITY CONTROL FAILED',
+        breakdown: {
+          sha256: {
+            passed: sha256Valid,
+            statusText: sha256Valid ? 'PASSED (unexpected)' : 'FAILED - SHA-256 hash mismatch',
+          },
+          hmac: {
+            passed: hmacValid,
+            statusText: hmacValid ? 'PASSED (unexpected)' : 'FAILED - HMAC-SHA-256 mismatch',
+          },
+          rsaSignature: {
+            passed: rsaValid,
+            statusText: rsaValid ? 'PASSED (unexpected)' : 'FAILED - RSA signature invalid for altered payload',
+          },
+        },
+      },
       status: attackDetected ? 'TRANSACTION_TAMPERING_DETECTED' : 'TAMPERING_UNDETECTED',
       message: attackDetected
         ? '🚨 TRANSACTION TAMPERING DETECTED: Mathematical failure across cryptographic layers.'
@@ -441,6 +465,158 @@ const simulateForgeryAttack = async (req, res, next) => {
 };
 
 /**
+ * ATTACK 4: Fake Payment Confirmation
+ * POST /api/attacks/fake-confirmation
+ *
+ * A recipient is shown a client-side "payment successful" message. The server
+ * independently looks up the real transaction state and reports whether the
+ * claim matches reality. The client can NEVER declare a payment approved.
+ */
+const simulateFakeConfirmation = async (req, res, next) => {
+  try {
+    const {
+      transactionId,
+      claimedStatus = 'COMPLETED',
+      claimedAmount,
+      claimedReceiver,
+    } = req.body;
+
+    if (!transactionId || !String(transactionId).trim()) {
+      return res.status(400).json({
+        success: false,
+        message: 'A claimed transaction ID is required for the fake confirmation test.',
+      });
+    }
+
+    const tx = await getTransaction(String(transactionId).trim());
+    const serverStatus = tx ? (tx.status || 'PENDING') : 'NOT_FOUND';
+
+    const normalize = (s) => {
+      const v = String(s || '').toUpperCase();
+      return v === 'SUCCESS' ? 'COMPLETED' : v;
+    };
+
+    const claimNormalized = normalize(claimedStatus);
+    const statusMatch = !!tx && claimNormalized === normalize(serverStatus);
+    const amountMatch =
+      claimedAmount === undefined ||
+      claimedAmount === null ||
+      claimedAmount === '' ||
+      (!!tx && Math.abs(Number(claimedAmount) - Number(tx.amount)) < 0.005);
+    const receiverMatch =
+      !claimedReceiver ||
+      !String(claimedReceiver).trim() ||
+      (!!tx &&
+        String(tx.receiver || tx.receiverName || '').toLowerCase() ===
+          String(claimedReceiver).trim().toLowerCase());
+
+    const claimVerified = !!tx && statusMatch && amountMatch && receiverMatch;
+    const attackDetected = !claimVerified;
+    const serverApproved = !!tx && normalize(serverStatus) === 'COMPLETED';
+
+    // Describe EXACTLY which part of the client claim the server rejected, so
+    // the UI and the audit log never blame the wrong check.
+    const mismatches = [];
+    if (!tx) {
+      mismatches.push(`no transaction '${String(transactionId).trim()}' exists in the server ledger`);
+    } else {
+      if (!statusMatch) {
+        mismatches.push(`claimed status ${claimNormalized} does not match server status ${serverStatus}`);
+      }
+      if (!amountMatch) {
+        mismatches.push(
+          `claimed amount ${Number(claimedAmount)} does not match the server amount ${tx.amount} ${tx.currency || 'INR'}`
+        );
+      }
+      if (!receiverMatch) {
+        mismatches.push(
+          `claimed receiver "${String(claimedReceiver).trim()}" does not match the server receiver "${tx.receiver || tx.receiverName || ''}"`
+        );
+      }
+    }
+
+    await recordSecurityEvent({
+      eventType: attackDetected ? 'FAKE_CONFIRMATION_DETECTED' : 'FAKE_CONFIRMATION_VERIFIED',
+      severity: attackDetected ? 'HIGH' : 'INFO',
+      result: attackDetected ? 'BLOCKED' : 'SUCCESS',
+      details: attackDetected
+        ? `Fake payment confirmation exposed for '${transactionId}': ${mismatches.join('; ')}.`
+        : `Client confirmation for '${transactionId}' matches the authoritative server status (${serverStatus}).`,
+      transactionId: tx ? tx.transactionId : String(transactionId),
+      metadata: {
+        attackType: 'fake-confirmation',
+        claimedStatus: claimNormalized,
+        claimedAmount: claimedAmount !== undefined && claimedAmount !== '' ? Number(claimedAmount) : null,
+        serverStatus,
+        serverAmount: tx ? tx.amount : null,
+        mismatches,
+      },
+    });
+
+    return res.status(200).json({
+      success: true,
+      attack: 'fake-confirmation',
+      attackDetected,
+      claimVerified,
+      status: attackDetected ? 'FAKE_CONFIRMATION_DETECTED' : 'SERVER_CONFIRMED_PAYMENT',
+      reason: attackDetected ? 'CLAIM_MISMATCH' : 'CLAIM_MATCHED',
+      mismatches,
+      message: attackDetected
+        ? `The claimed payment confirmation does NOT match the authoritative server record: ${mismatches.join('; ')}. A success message alone does not prove a payment was processed.`
+        : 'The claim matches the authoritative server record.',
+      claimed: {
+        transactionId: String(transactionId).trim(),
+        claimedStatus: claimNormalized,
+        claimedAmount: claimedAmount !== undefined && claimedAmount !== '' ? Number(claimedAmount) : null,
+        source: 'client-side message',
+      },
+      server: {
+        transactionId: tx ? tx.transactionId : String(transactionId).trim(),
+        serverStatus,
+        approved: serverApproved,
+        amount: tx ? tx.amount : null,
+        currency: tx ? tx.currency || 'INR' : null,
+        sender: tx ? tx.sender || tx.senderName : null,
+        receiver: tx ? tx.receiver || tx.receiverName : null,
+        processedAt: tx ? tx.processedAt || null : null,
+      },
+      checks: {
+        serverLookup: {
+          verified: !!tx,
+          status: tx ? 'FOUND' : 'NOT_FOUND',
+          message: tx
+            ? 'Transaction exists in the server ledger.'
+            : 'No such transaction exists in the server ledger.',
+        },
+        statusMatch: {
+          verified: statusMatch,
+          status: statusMatch ? 'MATCH' : 'MISMATCH',
+          message: statusMatch
+            ? `Claimed status matches server status (${serverStatus}).`
+            : `Claimed status ${claimNormalized} does not match server status ${serverStatus}.`,
+        },
+        amountMatch: {
+          verified: amountMatch,
+          status: amountMatch ? 'MATCH' : 'MISMATCH',
+          message: amountMatch
+            ? 'Claimed amount matches the server record.'
+            : `Claimed amount does not match the server record (${tx ? `${tx.amount} ${tx.currency || 'INR'}` : 'no record'}).`,
+        },
+        receiverMatch: {
+          verified: receiverMatch,
+          status: receiverMatch ? 'MATCH' : 'MISMATCH',
+          message: receiverMatch
+            ? 'Claimed receiver matches the server record.'
+            : 'Claimed receiver does not match the server record.',
+        },
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
  * Backwards-compatible general attack simulator endpoint
  * POST /api/simulation/attack
  */
@@ -450,6 +626,8 @@ const simulateAttack = async (req, res, next) => {
     return simulateReplayAttack(req, res, next);
   } else if (attackType === 'SIGNATURE_FORGERY') {
     return simulateForgeryAttack(req, res, next);
+  } else if (attackType === 'FAKE_CONFIRMATION') {
+    return simulateFakeConfirmation(req, res, next);
   } else {
     return simulateTamperingAttack(req, res, next);
   }
@@ -459,5 +637,6 @@ module.exports = {
   simulateTamperingAttack,
   simulateReplayAttack,
   simulateForgeryAttack,
+  simulateFakeConfirmation,
   simulateAttack,
 };

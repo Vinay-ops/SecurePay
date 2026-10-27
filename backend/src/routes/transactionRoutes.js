@@ -9,6 +9,7 @@ const {
   verifyTransactionCombinedSecurity,
   getTransactions,
   getTransactionById,
+  getTransactionStatus,
 } = require('../controllers/paymentController');
 const { protect } = require('../middleware/authMiddleware');
 
@@ -46,6 +47,9 @@ router.get('/:transactionId/verify-signature', verifyTransactionSignature);
 
 // Query transactions
 router.get('/', getTransactions);
+
+// Authoritative server-side status (must be registered before '/:id')
+router.get('/:id/status', getTransactionStatus);
 router.get('/:id', getTransactionById);
 
 module.exports = router;

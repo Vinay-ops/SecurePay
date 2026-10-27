@@ -5,17 +5,18 @@ const { v4: uuidv4 } = require('uuid');
 const User = require('../models/User');
 const SecurityLog = require('../models/SecurityLog');
 const { generateRSAKeyPair, computeKeyFingerprint } = require('../crypto/rsa');
+const { getJwtSecret } = require('../config/secrets');
 
 // Fallback in-memory user store if database is offline
 const inMemoryUsers = new Map();
 
-// Helper to sign JWT
+// Helper to sign JWT (secret is environment-provided or ephemeral; never hardcoded)
 const generateToken = (id, name, email, role) => {
-  return jwt.sign(
-    { id, name, email, role },
-    process.env.JWT_SECRET || 'super_secret_cryptographic_jwt_key_2026',
-    { expiresIn: '7d' }
-  );
+  const secret = getJwtSecret();
+  if (!secret) {
+    throw new Error('JWT_SECRET is not configured on the server.');
+  }
+  return jwt.sign({ id, name, email, role }, secret, { expiresIn: '7d' });
 };
 
 /**

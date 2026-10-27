@@ -3,7 +3,23 @@ const mongoose = require('mongoose');
 const Transaction = require('../models/Transaction');
 const SecurityLog = require('../models/SecurityLog');
 const { getDBStatus } = require('../config/db');
-const { inMemoryTransactions, inMemoryLogs } = require('../store/inMemoryStore');
+const { inMemoryTransactions, inMemoryLogs, saveStore } = require('../store/inMemoryStore');
+const { isDemoResetAllowed, getStorageMode } = require('../config/secrets');
+
+// Every event type that represents an attack attempt recorded by the simulator.
+const ATTACK_EVENT_TYPES = [
+  'TAMPERING_DETECTED',
+  'TAMPERING_ATTACK_DETECTED',
+  'HASH_MISMATCH_DETECTED',
+  'REPLAY_DETECTED',
+  'REPLAY_ATTACK_DETECTED',
+  'REPLAY_ATTACK_BLOCKED',
+  'FORGERY_DETECTED',
+  'FORGERY_ATTACK_DETECTED',
+  'FAKE_CONFIRMATION_DETECTED',
+];
+
+const countAttackLogs = (logs) => logs.filter((l) => ATTACK_EVENT_TYPES.includes(l.eventType));
 
 /**
  * Record a real security event to MongoDB or in-memory store
@@ -36,9 +52,11 @@ async function recordSecurityEvent({
       await SecurityLog.create(logEntry);
     } catch (err) {
       inMemoryLogs.unshift(logEntry);
+      saveStore();
     }
   } else {
     inMemoryLogs.unshift(logEntry);
+    saveStore();
   }
 
   // Keep in-memory logs limited to last 200 items
@@ -65,6 +83,10 @@ const getSecurityDashboardMetrics = async (req, res, next) => {
     let tamperingCount = 0;
     let replayCount = 0;
     let forgeryCount = 0;
+    let fakeConfirmationCount = 0;
+    let attacksAttempted = 0;
+    let attacksDetected = 0;
+    let timestampExpired = 0;
 
     let sha256Passed = 0;
     let sha256Failed = 0;
@@ -95,6 +117,18 @@ const getSecurityDashboardMetrics = async (req, res, next) => {
         forgeryCount = await SecurityLog.countDocuments({
           eventType: { $in: ['FORGERY_DETECTED', 'FORGERY_ATTACK_DETECTED'] },
         });
+        fakeConfirmationCount = await SecurityLog.countDocuments({
+          eventType: 'FAKE_CONFIRMATION_DETECTED',
+        });
+
+        attacksAttempted = await SecurityLog.countDocuments({
+          eventType: { $in: ATTACK_EVENT_TYPES },
+        });
+        attacksDetected = await SecurityLog.countDocuments({
+          eventType: { $in: ATTACK_EVENT_TYPES },
+          result: 'BLOCKED',
+        });
+        timestampExpired = await SecurityLog.countDocuments({ eventType: 'TIMESTAMP_EXPIRED' });
 
         // Verification counts from SecurityLog
         sha256Passed = await SecurityLog.countDocuments({ eventType: 'INTEGRITY_VERIFIED' });
@@ -127,6 +161,10 @@ const getSecurityDashboardMetrics = async (req, res, next) => {
         tamperingCount = inMemoryLogs.filter((l) => ['TAMPERING_DETECTED', 'TAMPERING_ATTACK_DETECTED', 'HASH_MISMATCH_DETECTED'].includes(l.eventType)).length;
         replayCount = inMemoryLogs.filter((l) => ['REPLAY_DETECTED', 'REPLAY_ATTACK_DETECTED', 'REPLAY_ATTACK_BLOCKED'].includes(l.eventType)).length;
         forgeryCount = inMemoryLogs.filter((l) => ['FORGERY_DETECTED', 'FORGERY_ATTACK_DETECTED'].includes(l.eventType)).length;
+        fakeConfirmationCount = inMemoryLogs.filter((l) => l.eventType === 'FAKE_CONFIRMATION_DETECTED').length;
+        attacksAttempted = countAttackLogs(inMemoryLogs).length;
+        attacksDetected = countAttackLogs(inMemoryLogs).filter((l) => l.result === 'BLOCKED').length;
+        timestampExpired = inMemoryLogs.filter((l) => l.eventType === 'TIMESTAMP_EXPIRED').length;
 
         sha256Passed = inMemoryLogs.filter((l) => l.eventType === 'INTEGRITY_VERIFIED').length;
         sha256Failed = inMemoryLogs.filter((l) => ['HASH_MISMATCH_DETECTED', 'INTEGRITY_FAILURE'].includes(l.eventType)).length;
@@ -152,6 +190,10 @@ const getSecurityDashboardMetrics = async (req, res, next) => {
       tamperingCount = inMemoryLogs.filter((l) => ['TAMPERING_DETECTED', 'TAMPERING_ATTACK_DETECTED', 'HASH_MISMATCH_DETECTED'].includes(l.eventType)).length;
       replayCount = inMemoryLogs.filter((l) => ['REPLAY_DETECTED', 'REPLAY_ATTACK_DETECTED', 'REPLAY_ATTACK_BLOCKED'].includes(l.eventType)).length;
       forgeryCount = inMemoryLogs.filter((l) => ['FORGERY_DETECTED', 'FORGERY_ATTACK_DETECTED'].includes(l.eventType)).length;
+      fakeConfirmationCount = inMemoryLogs.filter((l) => l.eventType === 'FAKE_CONFIRMATION_DETECTED').length;
+      attacksAttempted = countAttackLogs(inMemoryLogs).length;
+      attacksDetected = countAttackLogs(inMemoryLogs).filter((l) => l.result === 'BLOCKED').length;
+      timestampExpired = inMemoryLogs.filter((l) => l.eventType === 'TIMESTAMP_EXPIRED').length;
 
       sha256Passed = inMemoryLogs.filter((l) => l.eventType === 'INTEGRITY_VERIFIED').length;
       sha256Failed = inMemoryLogs.filter((l) => ['HASH_MISMATCH_DETECTED', 'INTEGRITY_FAILURE'].includes(l.eventType)).length;
@@ -168,7 +210,7 @@ const getSecurityDashboardMetrics = async (req, res, next) => {
       recentLogs = inMemoryLogs.slice(0, 10);
     }
 
-    const totalAttacksBlocked = tamperingCount + replayCount + forgeryCount;
+    const totalAttacksBlocked = tamperingCount + replayCount + forgeryCount + fakeConfirmationCount;
 
     // Documented Security Score Formula:
     // Ratio of legitimate/verified events + blocked attacks vs total traffic
@@ -187,13 +229,18 @@ const getSecurityDashboardMetrics = async (req, res, next) => {
       totalTransactions,
       successfulTransactions,
       pendingTransactions,
+      awaitingVerification: pendingTransactions,
       rejectedTransactions,
       securityScore,
+      storageMode: getStorageMode(dbStatus.connected),
       securityScoreFormula: '((Successful + Pending + Blocked Attacks) / (Total Transactions + Total Attacks)) * 100',
       attacks: {
         tampering: tamperingCount,
         replay: replayCount,
         forgery: forgeryCount,
+        fakeConfirmation: fakeConfirmationCount,
+        attempted: attacksAttempted,
+        detected: attacksDetected,
         total: totalAttacksBlocked,
       },
       verification: {
@@ -204,6 +251,7 @@ const getSecurityDashboardMetrics = async (req, res, next) => {
         rsaPassed,
         rsaFailed,
         replayBlocked,
+        timestampExpired,
       },
       systemEngines: {
         sha256: {
@@ -265,10 +313,13 @@ const getSecurityDashboardMetrics = async (req, res, next) => {
  */
 const getSecurityAuditLogs = async (req, res, next) => {
   try {
-    const { severity, limit = 50 } = req.query;
+    const { severity, limit = 50, transactionId } = req.query;
     let query = {};
     if (severity && severity !== 'ALL') {
       query.severity = severity;
+    }
+    if (transactionId) {
+      query.transactionId = transactionId;
     }
 
     let logs = [];
@@ -280,7 +331,10 @@ const getSecurityAuditLogs = async (req, res, next) => {
         logs = inMemoryLogs;
       }
     } else {
-      logs = inMemoryLogs.filter((l) => (severity && severity !== 'ALL' ? l.severity === severity : true)).slice(0, Number(limit));
+      logs = inMemoryLogs
+        .filter((l) => (severity && severity !== 'ALL' ? l.severity === severity : true))
+        .filter((l) => (transactionId ? l.transactionId === transactionId : true))
+        .slice(0, Number(limit));
     }
 
     res.status(200).json({
@@ -296,11 +350,22 @@ const getSecurityAuditLogs = async (req, res, next) => {
 const { clearNonceStore } = require('../crypto/nonce');
 
 /**
- * Reset all ledger transactions, security logs, and nonces to zero state
+ * Reset all ledger transactions, security logs, and nonces to zero state.
  * POST /api/security/reset or POST /api/dashboard/reset
+ *
+ * Destructive: restricted to local/demo environments. In production the
+ * endpoint refuses to run unless ALLOW_DEMO_RESET=true is explicitly set.
  */
 const resetDemoState = async (req, res, next) => {
   try {
+    if (!isDemoResetAllowed()) {
+      return res.status(403).json({
+        success: false,
+        reason: 'RESET_DISABLED_IN_PRODUCTION',
+        message: 'Demo reset is disabled in production. Set ALLOW_DEMO_RESET=true to enable it explicitly.',
+      });
+    }
+
     const isDbReady = mongoose.connection && mongoose.connection.readyState === 1;
     if (isDbReady) {
       try {
@@ -311,6 +376,7 @@ const resetDemoState = async (req, res, next) => {
 
     inMemoryTransactions.length = 0;
     inMemoryLogs.length = 0;
+    if (!isDbReady) saveStore();
     clearNonceStore();
 
     res.status(200).json({

@@ -9,6 +9,7 @@ const {
   verifyTransactionCombinedSecurity,
   getTransactions,
   getTransactionById,
+  getTransactionStatus,
 } = require('../controllers/paymentController');
 const { protect } = require('../middleware/authMiddleware');
 
@@ -30,6 +31,7 @@ router.post('/:transactionId/verify-integrity', verifyTransactionIntegrity);
 router.post('/:transactionId/verify-hmac', verifyTransactionHMAC);
 router.post('/:transactionId/verify-signature', verifyTransactionSignature);
 router.get('/', getTransactions);
+router.get('/:id/status', getTransactionStatus);
 router.get('/:id', getTransactionById);
 
 module.exports = router;
