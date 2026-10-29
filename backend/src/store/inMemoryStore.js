@@ -3,17 +3,21 @@
 // JSON file keeps data across backend restarts.
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 
-const defaultStorePath = path.join(__dirname, '..', '..', 'data', 'securepay.json');
+const backendRoot = path.resolve(__dirname, '..', '..');
+const defaultPersistentStorePath = path.join(backendRoot, 'data', 'securepay.json');
+const defaultServerlessStorePath = path.join(os.tmpdir(), 'securepay', 'securepay.json');
 const configuredStorePath = process.env.LOCAL_DB_PATH;
-const storePath = configuredStorePath
+let storePath = configuredStorePath
   ? (path.isAbsolute(configuredStorePath)
     ? configuredStorePath
-    : path.resolve(__dirname, '..', '..', configuredStorePath))
-  : defaultStorePath;
+    : path.resolve(backendRoot, configuredStorePath))
+  : (process.env.VERCEL ? defaultServerlessStorePath : defaultPersistentStorePath);
 
 const inMemoryTransactions = [];
 const inMemoryLogs = [];
+let warnedFallback = false;
 
 function loadStore() {
   if (!fs.existsSync(storePath)) return;
@@ -32,26 +36,50 @@ function loadStore() {
 }
 
 function saveStore() {
-  const directory = path.dirname(storePath);
-  fs.mkdirSync(directory, { recursive: true });
+  try {
+    const directory = path.dirname(storePath);
+    fs.mkdirSync(directory, { recursive: true });
 
-  const temporaryPath = `${storePath}.tmp`;
-  fs.writeFileSync(
-    temporaryPath,
-    JSON.stringify({
-      transactions: inMemoryTransactions,
-      logs: inMemoryLogs,
-    }, null, 2),
-    'utf8'
-  );
-  fs.renameSync(temporaryPath, storePath);
+    const temporaryPath = `${storePath}.tmp`;
+    fs.writeFileSync(
+      temporaryPath,
+      JSON.stringify({
+        transactions: inMemoryTransactions,
+        logs: inMemoryLogs,
+      }, null, 2),
+      'utf8'
+    );
+    fs.renameSync(temporaryPath, storePath);
+    return true;
+  } catch (error) {
+    const canFallbackToTmp = storePath !== defaultServerlessStorePath;
+    if (canFallbackToTmp) {
+      if (!warnedFallback) {
+        warnedFallback = true;
+        console.warn(
+          `[Database] Local store path ${storePath} is not writable (${error.code || 'UNKNOWN'}: ${error.message}). Falling back to temporary storage at ${defaultServerlessStorePath}.`
+        );
+      }
+      storePath = defaultServerlessStorePath;
+      return saveStore();
+    }
+
+    console.error(
+      `[Database] Failed to persist local store at ${storePath} (${error.code || 'UNKNOWN'}: ${error.message}). Continuing in memory only.`
+    );
+    return false;
+  }
 }
 
 loadStore();
+
+const getStorePath = () => storePath;
+const isStorePersistent = () => storePath !== defaultServerlessStorePath;
 
 module.exports = {
   inMemoryTransactions,
   inMemoryLogs,
   saveStore,
-  storePath,
+  getStorePath,
+  isStorePersistent,
 };
